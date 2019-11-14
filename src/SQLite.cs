@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2009-2018 Krueger Systems, Inc.
+// Copyright (c) 2009-2019 Krueger Systems, Inc.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files (the "Software"), to deal
@@ -46,10 +46,12 @@ using Sqlite3DatabaseHandle = Sqlite.Database;
 using Sqlite3Statement = Sqlite.Statement;
 #elif USE_SQLITEPCL_RAW
 using Sqlite3DatabaseHandle = SQLitePCL.sqlite3;
+using Sqlite3BackupHandle = SQLitePCL.sqlite3_backup;
 using Sqlite3Statement = SQLitePCL.sqlite3_stmt;
 using Sqlite3 = SQLitePCL.raw;
 #else
 using Sqlite3DatabaseHandle = System.IntPtr;
+using Sqlite3BackupHandle = System.IntPtr;
 using Sqlite3Statement = System.IntPtr;
 #endif
 
@@ -174,6 +176,7 @@ namespace SQLite
 
 		public Sqlite3DatabaseHandle Handle { get; private set; }
 		static readonly Sqlite3DatabaseHandle NullHandle = default (Sqlite3DatabaseHandle);
+		static readonly Sqlite3BackupHandle NullBackupHandle = default (Sqlite3BackupHandle);
 
 		/// <summary>
 		/// Gets the database path used by this connection.
@@ -207,6 +210,23 @@ namespace SQLite
 		/// </summary>
 		public bool StoreDateTimeAsTicks { get; private set; }
 
+		/// <summary>
+		/// Whether to store TimeSpan properties as ticks (true) or strings (false).
+		/// </summary>
+		public bool StoreTimeSpanAsTicks { get; private set; }
+
+		/// <summary>
+		/// The format to use when storing DateTime properties as strings. Ignored if StoreDateTimeAsTicks is true.
+		/// </summary>
+		/// <value>The date time string format.</value>
+		public string DateTimeStringFormat { get; private set; }
+
+		/// <summary>
+		/// The DateTimeStyles value to use when parsing a DateTime property string.
+		/// </summary>
+		/// <value>The date time style.</value>
+		internal System.Globalization.DateTimeStyles DateTimeStyle { get; private set; }
+
 #if USE_SQLITEPCL_RAW && !NO_SQLITEPCL_RAW_BATTERIES
 		static SQLiteConnection ()
 		{
@@ -228,11 +248,8 @@ namespace SQLite
 		/// If you use DateTimeOffset properties, it will be always stored as ticks regardingless
 		/// the storeDateTimeAsTicks parameter.
 		/// </param>
-		/// <param name="key">
-		/// Specifies the encryption key to use on the database. Should be a string or a byte[].
-		/// </param>
-		public SQLiteConnection (string databasePath, bool storeDateTimeAsTicks = true, object key = null)
-			: this (databasePath, SQLiteOpenFlags.ReadWrite | SQLiteOpenFlags.Create, storeDateTimeAsTicks, key: key)
+		public SQLiteConnection (string databasePath, bool storeDateTimeAsTicks = true)
+			: this (new SQLiteConnectionString (databasePath, SQLiteOpenFlags.ReadWrite | SQLiteOpenFlags.Create, storeDateTimeAsTicks))
 		{
 		}
 
@@ -253,15 +270,25 @@ namespace SQLite
 		/// If you use DateTimeOffset properties, it will be always stored as ticks regardingless
 		/// the storeDateTimeAsTicks parameter.
 		/// </param>
-		/// <param name="key">
-		/// Specifies the encryption key to use on the database. Should be a string or a byte[].
-		/// </param>
-		public SQLiteConnection (string databasePath, SQLiteOpenFlags openFlags, bool storeDateTimeAsTicks = true, object key = null)
+		public SQLiteConnection (string databasePath, SQLiteOpenFlags openFlags, bool storeDateTimeAsTicks = true)
+			: this (new SQLiteConnectionString (databasePath, openFlags, storeDateTimeAsTicks))
 		{
-			if (databasePath==null)
-				throw new ArgumentException ("Must be specified", nameof(databasePath));
+		}
 
-			DatabasePath = databasePath;
+		/// <summary>
+		/// Constructs a new SQLiteConnection and opens a SQLite database specified by databasePath.
+		/// </summary>
+		/// <param name="connectionString">
+		/// Details on how to find and open the database.
+		/// </param>
+		public SQLiteConnection (SQLiteConnectionString connectionString)
+		{
+			if (connectionString == null)
+				throw new ArgumentNullException (nameof (connectionString));
+			if (connectionString.DatabasePath == null)
+				throw new InvalidOperationException ("DatabasePath must be specified");
+
+			DatabasePath = connectionString.DatabasePath;
 
 			LibVersionNumber = SQLite3.LibVersionNumber ();
 
@@ -272,13 +299,13 @@ namespace SQLite
 			Sqlite3DatabaseHandle handle;
 
 #if SILVERLIGHT || USE_CSHARP_SQLITE || USE_SQLITEPCL_RAW
-			var r = SQLite3.Open (databasePath, out handle, (int)openFlags, IntPtr.Zero);
+			var r = SQLite3.Open (connectionString.DatabasePath, out handle, (int)connectionString.OpenFlags, connectionString.VfsName);
 #else
 			// open using the byte[]
 			// in the case where the path may include Unicode
 			// force open to using UTF-8 using sqlite3_open_v2
-			var databasePathAsBytes = GetNullTerminatedUtf8 (DatabasePath);
-			var r = SQLite3.Open (databasePathAsBytes, out handle, (int) openFlags, IntPtr.Zero);
+			var databasePathAsBytes = GetNullTerminatedUtf8 (connectionString.DatabasePath);
+			var r = SQLite3.Open (databasePathAsBytes, out handle, (int)connectionString.OpenFlags, connectionString.VfsName);
 #endif
 
 			Handle = handle;
@@ -287,23 +314,34 @@ namespace SQLite
 			}
 			_open = true;
 
-			StoreDateTimeAsTicks = storeDateTimeAsTicks;
+			StoreDateTimeAsTicks = connectionString.StoreDateTimeAsTicks;
+			DateTimeStringFormat = connectionString.DateTimeStringFormat;
+			DateTimeStyle = connectionString.DateTimeStyle;
 
 			BusyTimeout = TimeSpan.FromSeconds (0.1);
 			Tracer = line => Debug.WriteLine (line);
 
-			if (key is string stringKey) {
+			connectionString.PreKeyAction?.Invoke (this);
+			if (connectionString.Key is string stringKey) {
 				SetKey (stringKey);
 			}
-			else if (key is byte[] bytesKey) {
+			else if (connectionString.Key is byte[] bytesKey) {
 				SetKey (bytesKey);
 			}
-			else if (key != null) {
-				throw new ArgumentException ("Encryption keys must be strings or byte arrays", nameof (key));
+			else if (connectionString.Key != null) {
+				throw new InvalidOperationException ("Encryption keys must be strings or byte arrays");
 			}
-			if (openFlags.HasFlag (SQLiteOpenFlags.ReadWrite)) {
-				ExecuteScalar<string> ("PRAGMA journal_mode=WAL");
-			}
+			connectionString.PostKeyAction?.Invoke (this);
+		}
+
+		/// <summary>
+		/// Enables the write ahead logging. WAL is significantly faster in most scenarios
+		/// by providing better concurrency and better disk IO performance than the normal
+		/// jounral mode. You only need to call this function once in the lifetime of the database.
+		/// </summary>
+		public void EnableWriteAheadLogging()
+		{
+			ExecuteScalar<string> ("PRAGMA journal_mode=WAL");
 		}
 
 		/// <summary>
@@ -527,7 +565,7 @@ namespace SQLite
 
 				// Build query.
 				var query = "create " + @virtual + "table if not exists \"" + map.TableName + "\" " + @using + "(\n";
-				var decls = map.Columns.Select (p => Orm.SqlDecl (p, StoreDateTimeAsTicks));
+				var decls = map.Columns.Select (p => Orm.SqlDecl (p, StoreDateTimeAsTicks, StoreTimeSpanAsTicks));
 				var decl = string.Join (",\n", decls.ToArray ());
 				query += decl;
 				query += ")";
@@ -793,7 +831,7 @@ namespace SQLite
 			}
 
 			foreach (var p in toBeAdded) {
-				var addCol = "alter table \"" + map.TableName + "\" add column " + Orm.SqlDecl (p, StoreDateTimeAsTicks);
+				var addCol = "alter table \"" + map.TableName + "\" add column " + Orm.SqlDecl (p, StoreDateTimeAsTicks, StoreTimeSpanAsTicks);
 				Execute (addCol);
 			}
 		}
@@ -1691,21 +1729,20 @@ namespace SQLite
 			var key = Tuple.Create (map.MappedType.FullName, extra);
 
 			lock (_insertCommandMap) {
-				_insertCommandMap.TryGetValue (key, out prepCmd);
+				if (_insertCommandMap.TryGetValue (key, out prepCmd)) {
+					return prepCmd;
+				}
 			}
 
-			if (prepCmd == null) {
-				prepCmd = CreateInsertCommand (map, extra);
-				var added = false;
-				lock (_insertCommandMap) {
-					if (!_insertCommandMap.ContainsKey (key)) {
-						_insertCommandMap.Add (key, prepCmd);
-						added = true;
-					}
-				}
-				if (!added) {
+			prepCmd = CreateInsertCommand (map, extra);
+			
+			lock (_insertCommandMap) {
+				if (_insertCommandMap.TryGetValue (key, out var existing)) {
 					prepCmd.Dispose ();
+					return existing;
 				}
+
+				_insertCommandMap.Add (key, prepCmd);
 			}
 
 			return prepCmd;
@@ -1953,6 +1990,44 @@ namespace SQLite
 			return count;
 		}
 
+		/// <summary>
+		/// Backup the entire database to the specified path.
+		/// </summary>
+		/// <param name="destinationDatabasePath">Path to backup file.</param>
+		/// <param name="databaseName">The name of the database to backup (usually "main").</param>
+		public void Backup (string destinationDatabasePath, string databaseName = "main")
+		{
+			// Open the destination
+			var r = SQLite3.Open (destinationDatabasePath, out var destHandle);
+			if (r != SQLite3.Result.OK) {
+				throw SQLiteException.New (r, "Failed to open destination database");
+			}
+
+			// Init the backup
+			var backup = SQLite3.BackupInit (destHandle, databaseName, Handle, databaseName);
+			if (backup == NullBackupHandle) {
+				SQLite3.Close (destHandle);
+				throw new Exception ("Failed to create backup");
+			}
+
+			// Perform it
+			SQLite3.BackupStep (backup, -1);
+			SQLite3.BackupFinish (backup);
+
+			// Check for errors
+			r = SQLite3.GetResult (destHandle);
+			string msg = "";
+			if (r != SQLite3.Result.OK) {
+				msg = SQLite3.GetErrmsg (destHandle);
+			}
+
+			// Close everything and report errors
+			SQLite3.Close (destHandle);
+			if (r != SQLite3.Result.OK) {
+				throw SQLiteException.New (r, msg);
+			}
+		}
+
 		~SQLiteConnection ()
 		{
 			Dispose (false);
@@ -2034,10 +2109,19 @@ namespace SQLite
 	/// </summary>
 	public class SQLiteConnectionString
 	{
-		public string ConnectionString { get; private set; }
-		public string DatabasePath { get; private set; }
-		public bool StoreDateTimeAsTicks { get; private set; }
-		public object Key { get; private set; }
+		const string DateTimeSqliteDefaultFormat = "yyyy'-'MM'-'dd'T'HH':'mm':'ss'.'fff";
+
+		public string UniqueKey { get; }
+		public string DatabasePath { get; }
+		public bool StoreDateTimeAsTicks { get; }
+		public bool StoreTimeSpanAsTicks { get; }
+		public string DateTimeStringFormat { get; }
+		public System.Globalization.DateTimeStyles DateTimeStyle { get; }
+		public object Key { get; }
+		public SQLiteOpenFlags OpenFlags { get; }
+		public Action<SQLiteConnection> PreKeyAction { get; }
+		public Action<SQLiteConnection> PostKeyAction { get; }
+		public string VfsName { get; }
 
 #if NETFX_CORE
 		static readonly string MetroStyleDataPath = Windows.Storage.ApplicationData.Current.LocalFolder.Path;
@@ -2055,11 +2139,109 @@ namespace SQLite
 
 #endif
 
-		public SQLiteConnectionString (string databasePath, bool storeDateTimeAsTicks, object key)
+		/// <summary>
+		/// Constructs a new SQLiteConnectionString with all the data needed to open an SQLiteConnection.
+		/// </summary>
+		/// <param name="databasePath">
+		/// Specifies the path to the database file.
+		/// </param>
+		/// <param name="storeDateTimeAsTicks">
+		/// Specifies whether to store DateTime properties as ticks (true) or strings (false). You
+		/// absolutely do want to store them as Ticks in all new projects. The value of false is
+		/// only here for backwards compatibility. There is a *significant* speed advantage, with no
+		/// down sides, when setting storeDateTimeAsTicks = true.
+		/// If you use DateTimeOffset properties, it will be always stored as ticks regardingless
+		/// the storeDateTimeAsTicks parameter.
+		/// </param>
+		public SQLiteConnectionString (string databasePath, bool storeDateTimeAsTicks = true)
+			: this (databasePath, SQLiteOpenFlags.Create | SQLiteOpenFlags.ReadWrite, storeDateTimeAsTicks)
 		{
-			ConnectionString = databasePath;
+		}
+
+		/// <summary>
+		/// Constructs a new SQLiteConnectionString with all the data needed to open an SQLiteConnection.
+		/// </summary>
+		/// <param name="databasePath">
+		/// Specifies the path to the database file.
+		/// </param>
+		/// <param name="storeDateTimeAsTicks">
+		/// Specifies whether to store DateTime properties as ticks (true) or strings (false). You
+		/// absolutely do want to store them as Ticks in all new projects. The value of false is
+		/// only here for backwards compatibility. There is a *significant* speed advantage, with no
+		/// down sides, when setting storeDateTimeAsTicks = true.
+		/// If you use DateTimeOffset properties, it will be always stored as ticks regardingless
+		/// the storeDateTimeAsTicks parameter.
+		/// </param>
+		/// <param name="key">
+		/// Specifies the encryption key to use on the database. Should be a string or a byte[].
+		/// </param>
+		/// <param name="preKeyAction">
+		/// Executes prior to setting key for SQLCipher databases
+		/// </param>
+		/// <param name="postKeyAction">
+		/// Executes after setting key for SQLCipher databases
+		/// </param>
+		/// <param name="vfsName">
+		/// Specifies the Virtual File System to use on the database.
+		/// </param>
+		public SQLiteConnectionString (string databasePath, bool storeDateTimeAsTicks, object key = null, Action<SQLiteConnection> preKeyAction = null, Action<SQLiteConnection> postKeyAction = null, string vfsName = null)
+			: this (databasePath, SQLiteOpenFlags.Create | SQLiteOpenFlags.ReadWrite, storeDateTimeAsTicks, key, preKeyAction, postKeyAction, vfsName)
+		{
+		}
+
+		/// <summary>
+		/// Constructs a new SQLiteConnectionString with all the data needed to open an SQLiteConnection.
+		/// </summary>
+		/// <param name="databasePath">
+		/// Specifies the path to the database file.
+		/// </param>
+		/// <param name="openFlags">
+		/// Flags controlling how the connection should be opened.
+		/// </param>
+		/// <param name="storeDateTimeAsTicks">
+		/// Specifies whether to store DateTime properties as ticks (true) or strings (false). You
+		/// absolutely do want to store them as Ticks in all new projects. The value of false is
+		/// only here for backwards compatibility. There is a *significant* speed advantage, with no
+		/// down sides, when setting storeDateTimeAsTicks = true.
+		/// If you use DateTimeOffset properties, it will be always stored as ticks regardingless
+		/// the storeDateTimeAsTicks parameter.
+		/// </param>
+		/// <param name="key">
+		/// Specifies the encryption key to use on the database. Should be a string or a byte[].
+		/// </param>
+		/// <param name="preKeyAction">
+		/// Executes prior to setting key for SQLCipher databases
+		/// </param>
+		/// <param name="postKeyAction">
+		/// Executes after setting key for SQLCipher databases
+		/// </param>
+		/// <param name="vfsName">
+		/// Specifies the Virtual File System to use on the database.
+		/// </param>
+		/// <param name="dateTimeStringFormat">
+		/// Specifies the format to use when storing DateTime properties as strings.
+		/// </param>
+		/// <param name="storeTimeSpanAsTicks">
+		/// Specifies whether to store TimeSpan properties as ticks (true) or strings (false). You
+		/// absolutely do want to store them as Ticks in all new projects. The value of false is
+		/// only here for backwards compatibility. There is a *significant* speed advantage, with no
+		/// down sides, when setting storeTimeSpanAsTicks = true.
+		/// </param>
+		public SQLiteConnectionString (string databasePath, SQLiteOpenFlags openFlags, bool storeDateTimeAsTicks, object key = null, Action<SQLiteConnection> preKeyAction = null, Action<SQLiteConnection> postKeyAction = null, string vfsName = null, string dateTimeStringFormat = DateTimeSqliteDefaultFormat, bool storeTimeSpanAsTicks = true)
+		{
+			if (key != null && !((key is byte[]) || (key is string)))
+				throw new ArgumentException ("Encryption keys must be strings or byte arrays", nameof (key));
+
+			UniqueKey = string.Format ("{0}_{1:X8}", databasePath, (uint)openFlags);
 			StoreDateTimeAsTicks = storeDateTimeAsTicks;
+			StoreTimeSpanAsTicks = storeTimeSpanAsTicks;
+			DateTimeStringFormat = dateTimeStringFormat;
+			DateTimeStyle = "o".Equals (DateTimeStringFormat, StringComparison.OrdinalIgnoreCase) || "r".Equals (DateTimeStringFormat, StringComparison.OrdinalIgnoreCase) ? System.Globalization.DateTimeStyles.RoundtripKind : System.Globalization.DateTimeStyles.None;
 			Key = key;
+			PreKeyAction = preKeyAction;
+			PostKeyAction = postKeyAction;
+			OpenFlags = openFlags;
+			VfsName = vfsName;
 
 #if NETFX_CORE
 			DatabasePath = IsInMemoryPath(databasePath)
@@ -2450,9 +2632,9 @@ namespace SQLite
 			return obj.GetType ();
 		}
 
-		public static string SqlDecl (TableMapping.Column p, bool storeDateTimeAsTicks)
+		public static string SqlDecl (TableMapping.Column p, bool storeDateTimeAsTicks, bool storeTimeSpanAsTicks)
 		{
-			string decl = "\"" + p.Name + "\" " + SqlType (p, storeDateTimeAsTicks) + " ";
+			string decl = "\"" + p.Name + "\" " + SqlType (p, storeDateTimeAsTicks, storeTimeSpanAsTicks) + " ";
 
 			if (p.IsPK) {
 				decl += "primary key ";
@@ -2470,7 +2652,7 @@ namespace SQLite
 			return decl;
 		}
 
-		public static string SqlType (TableMapping.Column p, bool storeDateTimeAsTicks)
+		public static string SqlType (TableMapping.Column p, bool storeDateTimeAsTicks, bool storeTimeSpanAsTicks)
 		{
 			var clrType = p.ColumnType;
 			if (clrType == typeof (Boolean) || clrType == typeof (Byte) || clrType == typeof (UInt16) || clrType == typeof (SByte) || clrType == typeof (Int16) || clrType == typeof (Int32) || clrType == typeof (UInt32) || clrType == typeof (Int64)) {
@@ -2488,7 +2670,7 @@ namespace SQLite
 				return "varchar";
 			}
 			else if (clrType == typeof (TimeSpan)) {
-				return "bigint";
+				return storeTimeSpanAsTicks ? "bigint" : "time";
 			}
 			else if (clrType == typeof (DateTime)) {
 				return storeDateTimeAsTicks ? "bigint" : "datetime";
@@ -2774,7 +2956,7 @@ namespace SQLite
 					b.Index = nextIdx++;
 				}
 
-				BindParameter (stmt, b.Index, b.Value, _conn.StoreDateTimeAsTicks);
+				BindParameter (stmt, b.Index, b.Value, _conn.StoreDateTimeAsTicks, _conn.DateTimeStringFormat, _conn.StoreTimeSpanAsTicks);
 			}
 		}
 
@@ -2782,7 +2964,7 @@ namespace SQLite
 
 	    const string DateTimeExactStoreFormat = "yyyy-MM-ddTHH:mm:ss.fffffffZ";
 
-		internal static void BindParameter (Sqlite3Statement stmt, int index, object value, bool storeDateTimeAsTicks)
+		internal static void BindParameter (Sqlite3Statement stmt, int index, object value, bool storeDateTimeAsTicks, string dateTimeStringFormat, bool storeTimeSpanAsTicks)
 		{
 			if (value == null) {
 				SQLite3.BindNull (stmt, index);
@@ -2807,14 +2989,20 @@ namespace SQLite
 					SQLite3.BindDouble (stmt, index, Convert.ToDouble (value));
 				}
 				else if (value is TimeSpan) {
-					SQLite3.BindInt64 (stmt, index, ((TimeSpan)value).Ticks);
+					if (storeTimeSpanAsTicks) {
+						SQLite3.BindInt64 (stmt, index, ((TimeSpan)value).Ticks);
+					}
+					else {
+						SQLite3.BindText (stmt, index, ((TimeSpan)value).ToString (), -1, NegativePointer);
+					}
 				}
 				else if (value is DateTime) {
 					if (storeDateTimeAsTicks) {
 						SQLite3.BindInt64 (stmt, index, ((DateTime)value).ToUniversalTime().Ticks);
 					}
 					else {
-						SQLite3.BindText (stmt, index, ((DateTime)value).ToUniversalTime().ToString (DateTimeExactStoreFormat, System.Globalization.CultureInfo.InvariantCulture), -1, NegativePointer);
+						// SQLite3.BindText (stmt, index, ((DateTime)value).ToUniversalTime().ToString (DateTimeExactStoreFormat, System.Globalization.CultureInfo.InvariantCulture), -1, NegativePointer);
+						SQLite3.BindText (stmt, index, ((DateTime)value).ToUniversalTime().ToString (dateTimeStringFormat, System.Globalization.CultureInfo.InvariantCulture), -1, NegativePointer);
 					}
 				}
 				else if (value is DateTimeOffset) {
@@ -2869,6 +3057,11 @@ namespace SQLite
 			}
 			else {
 				var clrTypeInfo = clrType.GetTypeInfo ();
+				if (clrTypeInfo.IsGenericType && clrTypeInfo.GetGenericTypeDefinition () == typeof (Nullable<>)) {
+					clrType = clrTypeInfo.GenericTypeArguments[0];
+					clrTypeInfo = clrType.GetTypeInfo ();
+				}
+
 				if (clrType == typeof (String)) {
 					return SQLite3.ColumnString (stmt, index);
 				}
@@ -2885,7 +3078,17 @@ namespace SQLite
 					return (float)SQLite3.ColumnDouble (stmt, index);
 				}
 				else if (clrType == typeof (TimeSpan)) {
-					return new TimeSpan (SQLite3.ColumnInt64 (stmt, index));
+					if (_conn.StoreTimeSpanAsTicks) {
+						return new TimeSpan (SQLite3.ColumnInt64 (stmt, index));
+					}
+					else {
+						var text = SQLite3.ColumnString (stmt, index);
+						TimeSpan resultTime;
+						if (!TimeSpan.TryParseExact (text, "c", System.Globalization.CultureInfo.InvariantCulture, System.Globalization.TimeSpanStyles.None, out resultTime)) {
+							resultTime = TimeSpan.Parse (text);
+						}
+						return resultTime;
+					}
 				}
 				else if (clrType == typeof (DateTime)) {
 					if (_conn.StoreDateTimeAsTicks) {
@@ -2894,7 +3097,7 @@ namespace SQLite
 					else {
 						var text = SQLite3.ColumnString (stmt, index);
 						DateTime resultDate;
-						if (!DateTime.TryParseExact (text, DateTimeExactStoreFormat, System.Globalization.CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.None, out resultDate)) {
+						if (!DateTime.TryParseExact (text, _conn.DateTimeStringFormat, System.Globalization.CultureInfo.InvariantCulture, _conn.DateTimeStyle, out resultDate)) {
 							resultDate = DateTime.Parse (text);
 						}
 						return resultDate.ToUniversalTime();
@@ -2998,7 +3201,7 @@ namespace SQLite
 			//bind the values.
 			if (source != null) {
 				for (int i = 0; i < source.Length; i++) {
-					SQLiteCommand.BindParameter (Statement, i + 1, source[i], Connection.StoreDateTimeAsTicks);
+					SQLiteCommand.BindParameter (Statement, i + 1, source[i], Connection.StoreDateTimeAsTicks, Connection.DateTimeStringFormat, Connection.StoreTimeSpanAsTicks);
 				}
 			}
 			r = SQLite3.Step (Statement);
@@ -3822,10 +4025,10 @@ namespace SQLite
 		public static extern Result Open ([MarshalAs(UnmanagedType.LPStr)] string filename, out IntPtr db);
 
 		[DllImport(LibraryPath, EntryPoint = "sqlite3_open_v2", CallingConvention=CallingConvention.Cdecl)]
-		public static extern Result Open ([MarshalAs(UnmanagedType.LPStr)] string filename, out IntPtr db, int flags, IntPtr zvfs);
+		public static extern Result Open ([MarshalAs(UnmanagedType.LPStr)] string filename, out IntPtr db, int flags, [MarshalAs (UnmanagedType.LPStr)] string zvfs);
 
 		[DllImport(LibraryPath, EntryPoint = "sqlite3_open_v2", CallingConvention = CallingConvention.Cdecl)]
-		public static extern Result Open(byte[] filename, out IntPtr db, int flags, IntPtr zvfs);
+		public static extern Result Open(byte[] filename, out IntPtr db, int flags, [MarshalAs (UnmanagedType.LPStr)] string zvfs);
 
 		[DllImport(LibraryPath, EntryPoint = "sqlite3_open16", CallingConvention = CallingConvention.Cdecl)]
 		public static extern Result Open16([MarshalAs(UnmanagedType.LPWStr)] string filename, out IntPtr db);
@@ -3972,23 +4175,35 @@ namespace SQLite
 			return result;
 		}
 
+		[DllImport (LibraryPath, EntryPoint = "sqlite3_errcode", CallingConvention = CallingConvention.Cdecl)]
+		public static extern Result GetResult (Sqlite3DatabaseHandle db);
+
 		[DllImport (LibraryPath, EntryPoint = "sqlite3_extended_errcode", CallingConvention = CallingConvention.Cdecl)]
 		public static extern ExtendedResult ExtendedErrCode (IntPtr db);
 
 		[DllImport (LibraryPath, EntryPoint = "sqlite3_libversion_number", CallingConvention = CallingConvention.Cdecl)]
 		public static extern int LibVersionNumber ();
+
+		[DllImport (LibraryPath, EntryPoint = "sqlite3_backup_init", CallingConvention = CallingConvention.Cdecl)]
+		public static extern Sqlite3BackupHandle BackupInit (Sqlite3DatabaseHandle destDb, [MarshalAs (UnmanagedType.LPStr)] string destName, Sqlite3DatabaseHandle sourceDb, [MarshalAs (UnmanagedType.LPStr)] string sourceName);
+
+		[DllImport (LibraryPath, EntryPoint = "sqlite3_backup_step", CallingConvention = CallingConvention.Cdecl)]
+		public static extern Result BackupStep (Sqlite3BackupHandle backup, int numPages);
+
+		[DllImport (LibraryPath, EntryPoint = "sqlite3_backup_finish", CallingConvention = CallingConvention.Cdecl)]
+		public static extern Result BackupFinish (Sqlite3BackupHandle backup);
 #else
 		public static Result Open (string filename, out Sqlite3DatabaseHandle db)
 		{
 			return (Result)Sqlite3.sqlite3_open (filename, out db);
 		}
 
-		public static Result Open (string filename, out Sqlite3DatabaseHandle db, int flags, IntPtr zVfs)
+		public static Result Open (string filename, out Sqlite3DatabaseHandle db, int flags, string vfsName)
 		{
 #if USE_WP8_NATIVE_SQLITE
-			return (Result)Sqlite3.sqlite3_open_v2(filename, out db, flags, "");
+			return (Result)Sqlite3.sqlite3_open_v2(filename, out db, flags, vfsName ?? "");
 #else
-			return (Result)Sqlite3.sqlite3_open_v2 (filename, out db, flags, null);
+			return (Result)Sqlite3.sqlite3_open_v2 (filename, out db, flags, vfsName);
 #endif
 		}
 
@@ -4049,7 +4264,7 @@ namespace SQLite
 
 		public static string GetErrmsg (Sqlite3DatabaseHandle db)
 		{
-			return Sqlite3.sqlite3_errmsg (db);
+			return Sqlite3.sqlite3_errmsg (db).utf8_to_string();
 		}
 
 		public static int BindParameterIndex (Sqlite3Statement stmt, string name)
@@ -4106,12 +4321,12 @@ namespace SQLite
 
 		public static string ColumnName (Sqlite3Statement stmt, int index)
 		{
-			return Sqlite3.sqlite3_column_name (stmt, index);
+			return Sqlite3.sqlite3_column_name (stmt, index).utf8_to_string ();
 		}
 
 		public static string ColumnName16 (Sqlite3Statement stmt, int index)
 		{
-			return Sqlite3.sqlite3_column_name (stmt, index);
+			return Sqlite3.sqlite3_column_name (stmt, index).utf8_to_string ();
 		}
 
 		public static ColType ColumnType (Sqlite3Statement stmt, int index)
@@ -4136,17 +4351,17 @@ namespace SQLite
 
 		public static string ColumnText (Sqlite3Statement stmt, int index)
 		{
-			return Sqlite3.sqlite3_column_text (stmt, index);
+			return Sqlite3.sqlite3_column_text (stmt, index).utf8_to_string ();
 		}
 
 		public static string ColumnText16 (Sqlite3Statement stmt, int index)
 		{
-			return Sqlite3.sqlite3_column_text (stmt, index);
+			return Sqlite3.sqlite3_column_text (stmt, index).utf8_to_string ();
 		}
 
 		public static byte[] ColumnBlob (Sqlite3Statement stmt, int index)
 		{
-			return Sqlite3.sqlite3_column_blob (stmt, index);
+			return Sqlite3.sqlite3_column_blob (stmt, index).ToArray ();
 		}
 
 		public static int ColumnBytes (Sqlite3Statement stmt, int index)
@@ -4156,7 +4371,7 @@ namespace SQLite
 
 		public static string ColumnString (Sqlite3Statement stmt, int index)
 		{
-			return Sqlite3.sqlite3_column_text (stmt, index);
+			return Sqlite3.sqlite3_column_text (stmt, index).utf8_to_string ();
 		}
 
 		public static byte[] ColumnByteArray (Sqlite3Statement stmt, int index)
@@ -4178,9 +4393,29 @@ namespace SQLite
 			return Sqlite3.sqlite3_libversion_number ();
 		}
 
+		public static Result GetResult (Sqlite3DatabaseHandle db)
+		{
+			return (Result)Sqlite3.sqlite3_errcode (db);
+		}
+
 		public static ExtendedResult ExtendedErrCode (Sqlite3DatabaseHandle db)
 		{
 			return (ExtendedResult)Sqlite3.sqlite3_extended_errcode (db);
+		}
+
+		public static Sqlite3BackupHandle BackupInit (Sqlite3DatabaseHandle destDb, string destName, Sqlite3DatabaseHandle sourceDb, string sourceName)
+		{
+			return Sqlite3.sqlite3_backup_init (destDb, destName, sourceDb, sourceName);
+		}
+
+		public static Result BackupStep (Sqlite3BackupHandle backup, int numPages)
+		{
+			return (Result)Sqlite3.sqlite3_backup_step (backup, numPages);
+		}
+
+		public static Result BackupFinish (Sqlite3BackupHandle backup)
+		{
+			return (Result)Sqlite3.sqlite3_backup_finish (backup);
 		}
 #endif
 
