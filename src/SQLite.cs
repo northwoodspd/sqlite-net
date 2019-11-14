@@ -1735,7 +1735,7 @@ namespace SQLite
 			}
 
 			prepCmd = CreateInsertCommand (map, extra);
-			
+
 			lock (_insertCommandMap) {
 				if (_insertCommandMap.TryGetValue (key, out var existing)) {
 					prepCmd.Dispose ();
@@ -3001,8 +3001,7 @@ namespace SQLite
 						SQLite3.BindInt64 (stmt, index, ((DateTime)value).ToUniversalTime().Ticks);
 					}
 					else {
-						// SQLite3.BindText (stmt, index, ((DateTime)value).ToUniversalTime().ToString (DateTimeExactStoreFormat, System.Globalization.CultureInfo.InvariantCulture), -1, NegativePointer);
-						SQLite3.BindText (stmt, index, ((DateTime)value).ToUniversalTime().ToString (dateTimeStringFormat, System.Globalization.CultureInfo.InvariantCulture), -1, NegativePointer);
+						SQLite3.BindText (stmt, index, ((DateTime)value).ToUniversalTime().ToString (DateTimeExactStoreFormat, System.Globalization.CultureInfo.InvariantCulture), -1, NegativePointer);
 					}
 				}
 				else if (value is DateTimeOffset) {
